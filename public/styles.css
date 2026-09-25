@@ -153,6 +153,16 @@ input[type="text"], select {
   color: var(--text);
 }
 
+input[type="file"] {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background: #fff;
+  color: var(--text);
+}
+
 input[type="text"]:focus, select:focus {
   outline: 2px solid rgba(37, 99, 235, 0.35);
   border-color: var(--primary);

@@ -320,6 +320,53 @@ app.post('/api/undo', (req, res) => {
 });
 
 /**
+ * 下载家谱备份：仅含成员 ID、姓名与父母→子女关系的 JSON 文件（附件形式），
+ * 用于把当前家谱迁移到另一台本地实例（恢复入口见下）。
+ */
+app.get('/api/backup', (req, res) => {
+  const data = store.list();
+  const backup = {
+    members: data.members.map((m) => ({ id: m.id, name: m.name })),
+    edges: data.edges.map((e) => ({ parentId: e.parentId, childId: e.childId })),
+  };
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="family-backup-${stamp}.json"`);
+  res.send(JSON.stringify(backup, null, 2));
+});
+
+/**
+ * 备份恢复预览（只读，不写入任何数据）：
+ * 服务端按 30 人上限、每名子女至多两位父母、无自指/重复关系/祖先环路
+ * 对请求体中的备份文件做整份严格校验，全部问题逐项返回（不静默丢弃）；
+ * 全部合法时返回将替换的成员与关系数量、内容指纹 fingerprint 及当前家谱版本 version。
+ * 请求体：备份文件内容本身（{ members: [...], edges: [...] }）
+ */
+app.post('/api/backup/preview', (req, res) => {
+  const result = store.previewBackup(req.body);
+  res.json({ version: store.getVersion(), ...result });
+});
+
+/**
+ * 备份恢复提交：必须携带预览返回的 version 与 fingerprint，以及同一份备份内容 backup。
+ * 服务端重新整份校验并比对指纹与版本：版本过期（409）、文件变更（409）或文件非法（400，
+ * 逐项 errors）都拒绝且零写入；全部通过时原子替换整个家谱、版本加一，
+ * 并把恢复前的完整家谱纳入最近一次撤销快照。
+ * 请求体：{ version: number, fingerprint: string, backup: { members: [...], edges: [...] } }
+ */
+app.post('/api/backup/restore', (req, res) => {
+  const body = req.body || {};
+  const result = store.restoreBackup(body.backup, body.version, body.fingerprint);
+  if (result.error) {
+    const payload = { error: result.error };
+    if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
+    if (result.errors) payload.errors = result.errors;
+    return sendError(res, result.status || 400, payload);
+  }
+  res.status(201).json(store.list());
+});
+
+/**
  * 查询两人共同祖先：
  * 沿父母链 BFS，找出总代数最少的全部共同祖先，
  * 并返回双方到每个祖先的全部最短亲缘路径（同代数不同路径全部保留）。
@@ -395,6 +442,9 @@ app.get('/api/generation-conflicts', (req, res) => {
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     return sendError(res, 400, '请求体不是合法的 JSON');
+  }
+  if (err && err.type === 'entity.too.large') {
+    return sendError(res, 413, '请求体过大，备份文件超出大小限制');
   }
   return next(err);
 });

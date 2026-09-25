@@ -3,7 +3,7 @@
 /**
  * JSON 文件持久化：启动时读取，每次变更后同步写入（先写临时文件再 rename）。
  *
- * 家谱版本 version：每次成功变更（成员增删改、关系增删/批量提交、合并、撤销）单调 +1，
+ * 家谱版本 version：每次成功变更（成员增删改、关系增删/批量提交、合并、备份恢复、撤销）单调 +1，
  * 并随数据落盘。批量预检返回当时的 version，提交时必须原样带回；
  * 预检与提交之间家谱若被其他操作改动，version 不匹配则整批拒绝。
  *
@@ -21,6 +21,7 @@ const {
   createState,
   validateEdge,
   validateEdgeBatch,
+  validateBackup,
   previewMergeMembers,
   isReachableUp,
   MAX_MEMBERS,
@@ -258,6 +259,69 @@ function createStore(filePath) {
     return { error: null };
   }
 
+  /**
+   * 备份恢复预览（只读，不写入任何数据、不推进版本）。
+   * 对备份文件做与录入规则完全一致的整份严格校验，全部问题逐项返回（不静默丢弃）；
+   * 全部合法时返回将替换的成员/关系数量与内容指纹——确认恢复时必须把指纹原样带回。
+   */
+  function previewBackup(raw) {
+    const check = validateBackup(raw);
+    return {
+      valid: check.valid,
+      errors: check.errors,
+      memberCount: check.members.length,
+      edgeCount: check.edges.length,
+      fingerprint: check.valid ? backupFingerprint(check.members, check.edges) : null,
+    };
+  }
+
+  /**
+   * 备份恢复提交（乐观锁 + 内容指纹 + 服务端重验，全部通过后原子替换整个家谱）。
+   * 拒绝顺序：缺版本号（400）→ 版本过期（409，预览后家谱被修改）→
+   * 重新整份校验失败（400，逐项 errors）→ 缺指纹（400）→ 指纹不符（409，预览后文件被更换/改动）。
+   * 全部通过时走统一 commit 入口：恢复前的完整家谱成为唯一撤销快照，
+   * 备份内容整体替换当前家谱、版本 +1、同一次落盘（重启后仍可撤销这次恢复）。
+   */
+  function restoreBackup(raw, expectedVersion, expectedFingerprint) {
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+      return { error: '缺少家谱版本号，请先预览后再恢复', status: 400 };
+    }
+    if (expectedVersion !== version) {
+      return {
+        error: '家谱在预览后已被修改，请重新预览后再恢复',
+        status: 409,
+        currentVersion: version,
+      };
+    }
+
+    // 服务端重验文件：与预览完全相同的整份校验，逐项报错、不静默丢弃
+    const check = validateBackup(raw);
+    if (!check.valid) {
+      return {
+        error: `备份文件未通过校验（共 ${check.errors.length} 项问题），已取消恢复`,
+        status: 400,
+        errors: check.errors,
+      };
+    }
+
+    if (typeof expectedFingerprint !== 'string' || !expectedFingerprint) {
+      return { error: '缺少备份内容指纹，请先预览后再恢复', status: 400 };
+    }
+    if (expectedFingerprint !== backupFingerprint(check.members, check.edges)) {
+      return {
+        error: '备份文件在预览后已变更，请重新预览',
+        status: 409,
+        currentVersion: version,
+      };
+    }
+
+    const maxMembers = state.maxMembers;
+    commit(`恢复备份（${check.members.length} 名成员、${check.edges.length} 条关系）`, () => {
+      state = stateFromBackup(check.members, check.edges, maxMembers);
+    });
+    return { error: null };
+  }
+
   return {
     list,
     addMember,
@@ -269,6 +333,8 @@ function createStore(filePath) {
     validateEdgeBatch: (edges) => validateEdgeBatch(state, edges),
     previewMerge,
     commitMerge,
+    previewBackup,
+    restoreBackup,
     undoLast,
     getState: () => state,
     getVersion: () => version,
@@ -313,6 +379,29 @@ function familyToState(family) {
     members: family.members,
     edges: family.edges,
   });
+}
+
+/**
+ * 备份内容指纹：对校验通过后的规范化内容（成员 + 关系，保持文件顺序）计算 SHA-256。
+ * 预览时下发、确认时重算比对：内容有任何变化（含顺序变化）指纹都会不同。
+ */
+function backupFingerprint(members, edges) {
+  const canonical = JSON.stringify({ members, edges });
+  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+}
+
+/**
+ * 把校验通过的备份重建为运行时状态。
+ * 备份已通过整份严格校验（validateBackup），此处逐条照搬、不做任何静默丢弃。
+ */
+function stateFromBackup(members, edges, maxMembers = MAX_MEMBERS) {
+  const state = createState(maxMembers);
+  for (const m of members) {
+    state.members.push({ id: m.id, name: m.name });
+    state.parentsOf[m.id] = [];
+  }
+  for (const e of edges) state.parentsOf[e.childId].push(e.parentId);
+  return state;
 }
 
 function loadState(filePath) {
