@@ -320,6 +320,65 @@ app.post('/api/undo', (req, res) => {
 });
 
 /**
+ * 下载备份：仅含成员 ID、姓名与父母→子女关系的 JSON 文件，
+ * 可迁移到另一台本地实例恢复。不含版本号与撤销快照。
+ */
+app.get('/api/backup', (req, res) => {
+  const data = store.list();
+  const backup = {
+    members: data.members.map((m) => ({ id: m.id, name: m.name })),
+    edges: data.edges.map((e) => ({ parentId: e.parentId, childId: e.childId })),
+  };
+  const filename = `family-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.type('application/json').send(`${JSON.stringify(backup, null, 2)}\n`);
+});
+
+/**
+ * 备份恢复预览（只读，不写入任何数据）：
+ * 把备份文件原文整份严格校验（30 人上限、重复 ID、缺失端点、自指、
+ * 重复关系、每名子女至多两位父母、祖先环路），逐项返回全部问题；
+ * 通过时返回将恢复的成员/关系数量、内容指纹 fingerprint 与当前家谱版本 version。
+ * 请求体：{ content: "<备份文件原文>" }
+ */
+app.post('/api/backup/restore/preview', (req, res) => {
+  const content = req.body && req.body.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    return sendError(res, 400, '请提供备份文件内容（content 字段）');
+  }
+  const result = store.previewRestore(content);
+  res.json({
+    version: store.getVersion(),
+    valid: result.valid,
+    error: result.error,
+    errors: result.errors,
+    memberCount: result.memberCount,
+    edgeCount: result.edgeCount,
+    memberNames: result.members.map((m) => m.name),
+    fingerprint: result.fingerprint,
+  });
+});
+
+/**
+ * 备份恢复确认：必须携带预览返回的家谱版本 version 与内容指纹 fingerprint。
+ * 服务端重新计算指纹并整份重验：版本过期或文件被调换（409）、重验失败（400，
+ * 带逐项 errors）都整单拒绝、不修改任何数据；成功时原子替换整个家谱、
+ * 版本 +1 并纳入最近一次撤销（变更前家谱成为唯一可撤销快照）。
+ * 请求体：{ version: number, fingerprint: string, content: "<备份文件原文>" }
+ */
+app.post('/api/backup/restore', (req, res) => {
+  const body = req.body || {};
+  const result = store.restoreBackup(body.content, body.fingerprint, body.version);
+  if (result.error) {
+    const payload = { error: result.error };
+    if (result.currentVersion !== undefined) payload.currentVersion = result.currentVersion;
+    if (result.errors) payload.errors = result.errors;
+    return sendError(res, result.status || 400, payload);
+  }
+  res.json(store.list());
+});
+
+/**
  * 查询两人共同祖先：
  * 沿父母链 BFS，找出总代数最少的全部共同祖先，
  * 并返回双方到每个祖先的全部最短亲缘路径（同代数不同路径全部保留）。
@@ -395,6 +454,9 @@ app.get('/api/generation-conflicts', (req, res) => {
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     return sendError(res, 400, '请求体不是合法的 JSON');
+  }
+  if (err && err.type === 'entity.too.large') {
+    return sendError(res, 413, '请求体过大：备份文件超出大小限制');
   }
   return next(err);
 });

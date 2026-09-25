@@ -46,6 +46,12 @@ let impactPreview = null;
 let impactStale = false;
 let impactStaleReason = '';
 
+// 最近一次恢复预览：{ version, fingerprint, content, valid, errors, memberCount, edgeCount, memberNames }
+// 仅当 version 与当前家谱版本一致且所选文件未变化时有效；确认时原样带回指纹与版本
+let restorePreview = null;
+let restoreStale = false;
+let restoreStaleReason = '';
+
 const $ = (id) => document.getElementById(id);
 
 /** 安全创建 DOM 元素，避免 innerHTML 注入 */
@@ -108,6 +114,9 @@ async function refresh() {
   if (versionChanged && impactPreview && !impactStale) {
     invalidateImpactPreview('家谱已发生写入，以下预览基于旧版本，请重新预览');
   }
+  if (versionChanged && restorePreview && !restoreStale) {
+    invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
+  }
   render();
 }
 
@@ -123,6 +132,9 @@ function applyStateAndRender(data) {
   if (versionChanged && mergePreview && !mergeStale) invalidateMergePreview('家谱已变化，请重新预览合并');
   if (versionChanged && impactPreview && !impactStale) {
     invalidateImpactPreview('家谱已发生写入，以下预览基于旧版本，请重新预览');
+  }
+  if (versionChanged && restorePreview && !restoreStale) {
+    invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
   render();
 }
@@ -156,6 +168,7 @@ function render() {
   renderMerge();
   renderStaleBanner();
   renderUndo();
+  renderRestore();
 }
 
 /* ---------------- 最近操作与撤销 ---------------- */
@@ -1243,6 +1256,213 @@ function renderImpactResult(data) {
   if (data.added.length > 0) box.appendChild(renderImpactGroup('新增的矛盾', data.added));
   if (data.removed.length > 0) box.appendChild(renderImpactGroup('消失的矛盾', data.removed));
   if (data.changed.length > 0) box.appendChild(renderImpactGroup('代数范围变化的矛盾', data.changed));
+}
+
+/* ---------------- 备份与恢复 ---------------- */
+
+function invalidateRestorePreview(reason) {
+  restorePreview = null;
+  restoreStale = true;
+  restoreStaleReason = reason;
+  renderRestore();
+}
+
+/** 下载备份：仅含成员 ID、姓名与父母→子女关系的 JSON 文件 */
+$('backup-download').addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/backup');
+    if (!res.ok) throw new Error(`下载失败（${res.status}）`);
+    const blob = await res.blob();
+    const dispo = res.headers.get('Content-Disposition') || '';
+    const match = /filename="?([^";]+)"?/.exec(dispo);
+    const url = URL.createObjectURL(blob);
+    const a = el('a', { href: url, download: match ? match[1] : 'family-backup.json' });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`已下载备份（${state.members.length} 名成员、${state.edges.length} 条关系）`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// 重新选择文件后旧预览立即失效
+$('restore-file').addEventListener('change', () => {
+  invalidateRestorePreview('已重新选择文件，请重新预览恢复');
+});
+
+/** 预览恢复：服务端整份校验备份文件并逐项报错；预览不修改家谱 */
+async function previewRestoreBackup() {
+  const input = $('restore-file');
+  const file = input.files && input.files[0];
+  if (!file) { toast('请先选择备份 JSON 文件', true); return; }
+  let content;
+  try {
+    content = await file.text();
+  } catch (_) {
+    toast('无法读取所选文件', true);
+    return;
+  }
+  const status = $('restore-status');
+  status.hidden = false;
+  status.className = 'batch-status info';
+  status.textContent = '校验预览中…（不会修改家谱）';
+  try {
+    const data = await api('/api/backup/restore/preview', {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    });
+    // 请求往返期间文件选择可能已变化：结果只对当时的文件快照有效
+    if (!input.files || input.files[0] !== file) {
+      invalidateRestorePreview('文件选择在预览期间已变化，请重新预览');
+      return;
+    }
+    restorePreview = { ...data, content };
+    restoreStale = false;
+    restoreStaleReason = '';
+    renderRestore();
+  } catch (err) {
+    toast(err.message, true);
+    renderRestore();
+  }
+}
+
+/** 确认恢复：携带预览的内容指纹与家谱版本；文件被调换或版本过期都会被服务端拒绝 */
+async function submitRestore() {
+  if (!restorePreview || restoreStale || !restorePreview.valid) {
+    toast('请先预览且备份校验通过后再恢复', true);
+    return;
+  }
+  const msg =
+    '确定用备份整体替换当前家谱？\n\n' +
+    `备份内容：${restorePreview.memberCount} 名成员、${restorePreview.edgeCount} 条关系\n` +
+    `当前家谱：${state.members.length} 名成员、${state.edges.length} 条关系（将被整体替换）\n\n` +
+    '恢复成功后可通过「最近操作」撤销一次。';
+  if (!confirm(msg)) return;
+  const btn = $('restore-submit');
+  btn.disabled = true;
+  try {
+    const data = await api('/api/backup/restore', {
+      method: 'POST',
+      body: JSON.stringify({
+        version: restorePreview.version,
+        fingerprint: restorePreview.fingerprint,
+        content: restorePreview.content,
+      }),
+    });
+    restorePreview = null;
+    restoreStale = false;
+    restoreStaleReason = '';
+    $('restore-file').value = '';
+    applyStateAndRender(data);
+    markStale();
+    toast('备份已恢复：家谱已整体替换，如需回退可在「最近操作」中撤销');
+  } catch (err) {
+    if (err.status === 409) {
+      // 版本过期或内容指纹不符（文件被调换）：拉取最新状态并要求重新预览
+      invalidateRestorePreview(err.message);
+      refresh().catch(() => {});
+    } else if (err.body && Array.isArray(err.body.errors)) {
+      // 服务端重验未通过：逐项展示错误并禁止恢复
+      restorePreview = {
+        valid: false,
+        errors: err.body.errors,
+        error: err.body.error,
+        content: restorePreview.content,
+      };
+      restoreStale = false;
+      renderRestore();
+    }
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('restore-preview').addEventListener('click', previewRestoreBackup);
+$('restore-submit').addEventListener('click', submitRestore);
+
+function renderRestore() {
+  const status = $('restore-status');
+  const result = $('restore-result');
+  const previewBtn = $('restore-preview');
+  const submitBtn = $('restore-submit');
+  const hasFile = !!($('restore-file').files && $('restore-file').files.length);
+
+  previewBtn.disabled = !hasFile;
+  const live = restorePreview && !restoreStale;
+
+  if (!live) {
+    result.hidden = true;
+    submitBtn.disabled = true;
+    if (!hasFile) {
+      status.hidden = true;
+      return;
+    }
+    status.hidden = false;
+    status.className = 'batch-status warn';
+    status.textContent =
+      restoreStaleReason || '已选择文件但尚未预览：请点击「预览恢复」（预览不会修改家谱）。';
+    return;
+  }
+
+  status.hidden = false;
+  result.hidden = false;
+  renderRestoreResult(result, restorePreview);
+
+  if (restorePreview.valid) {
+    status.className = 'batch-status ok';
+    status.textContent =
+      `预览通过：备份含 ${restorePreview.memberCount} 名成员、${restorePreview.edgeCount} 条关系，` +
+      `确认后将整体替换当前家谱（当前 ${state.members.length} 名成员、${state.edges.length} 条关系）。` +
+      `基于家谱版本 ${restorePreview.version}，确认后版本 +1 并可经「最近操作」撤销；预览未修改任何数据。`;
+    submitBtn.disabled = false;
+  } else {
+    status.className = 'batch-status error';
+    status.textContent =
+      `备份文件未通过校验：共 ${restorePreview.errors.length} 项问题（见下），已禁止恢复；` +
+      '请修正文件后重新选择并预览。';
+    submitBtn.disabled = true;
+  }
+}
+
+function renderRestoreResult(box, data) {
+  box.replaceChildren();
+
+  if (!data.valid) {
+    const errBox = el('div', { class: 'merge-conflicts' });
+    errBox.appendChild(el('h4', { text: `校验未通过（${data.errors.length} 项问题）` }));
+    const ul = el('ul', { class: 'restore-errors' });
+    const whereLabel = { file: '文件', member: '成员', edge: '关系' };
+    for (const item of data.errors) {
+      ul.appendChild(el('li', {}, [
+        el('span', { class: 'restore-where', text: `【${whereLabel[item.where] || '文件'}】` }),
+        document.createTextNode(item.message),
+      ]));
+    }
+    errBox.appendChild(ul);
+    box.appendChild(errBox);
+    return;
+  }
+
+  const okBox = el('div');
+  okBox.appendChild(el('h4', {
+    text: `备份内容（${data.memberCount} 名成员、${data.edgeCount} 条关系）`,
+  }));
+  if (data.memberCount === 0) {
+    okBox.appendChild(el('p', {
+      class: 'empty-hint',
+      text: '备份为空家谱：确认后当前成员与关系将被全部清空（可撤销）。',
+    }));
+  } else {
+    const chips = el('div', { class: 'restore-members' });
+    for (const name of data.memberNames || []) {
+      chips.appendChild(el('span', { class: 'member-chip', text: name }));
+    }
+    okBox.appendChild(chips);
+  }
+  box.appendChild(okBox);
 }
 
 /* ---------------- 启动 ---------------- */

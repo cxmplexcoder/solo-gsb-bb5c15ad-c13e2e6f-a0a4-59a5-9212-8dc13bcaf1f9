@@ -14,7 +14,8 @@
       每次成功写入都可在顶部「最近操作」中一键撤销（重启后仍可撤销，仅可撤销一次）；
       选中两人即可沿父母链查询总代数最少的全部共同祖先及最短亲缘路径；
       还可一键核查全部「辈分矛盾」：同一对祖先与后代沿不同路径的最少 / 最多代数不一致时逐条列出；
-      「变更影响预览」可在不落盘的假设图上试算新增 / 移除一条关系前后辈分矛盾的逐对变化。
+      「变更影响预览」可在不落盘的假设图上试算新增 / 移除一条关系前后辈分矛盾的逐对变化；
+      「备份与恢复」可下载仅含成员 ID、姓名与关系的 JSON 备份，选择备份文件预览校验后整体恢复（可撤销）。
     </p>
   </header>
 
@@ -179,6 +180,35 @@
       </p>
       <div id="impact-result" class="result" aria-live="polite">
         <p class="placeholder">选择变更类型与父母、子女后点击「预览影响」。</p>
+      </div>
+    </section>
+
+    <!-- 备份与恢复 -->
+    <section class="card wide" aria-labelledby="backup-title">
+      <h2 id="backup-title">⑥ 备份与恢复</h2>
+      <div class="backup-actions">
+        <button type="button" id="backup-download">下载备份（JSON）</button>
+        <p class="empty-hint">
+          备份文件仅含成员 ID、姓名与父母→子女关系，可迁移到另一台本地实例恢复。
+        </p>
+      </div>
+      <div id="restore-panel" class="batch-panel">
+        <div class="batch-head">
+          <h3>从备份恢复</h3>
+          <div class="batch-actions">
+            <input type="file" id="restore-file" class="restore-file" accept="application/json,.json" />
+            <button type="button" id="restore-preview" class="primary">预览恢复</button>
+            <button type="button" id="restore-submit" disabled>确认恢复</button>
+          </div>
+        </div>
+        <p id="restore-status" class="batch-status" hidden></p>
+        <div id="restore-result" class="merge-result" hidden></div>
+        <p class="empty-hint">
+          选择本工具下载的 JSON 备份后点击「预览恢复」：服务端按 30 人上限、每名子女至多两位父母、
+          无自指 / 重复关系 / 祖先环路对整份文件逐条校验，重复 ID、缺失端点或非法关系会逐项列出，
+          预览不修改家谱。确认恢复将整体替换当前家谱（版本 +1，可经「最近操作」撤销）；
+          若预览后文件被调换或家谱被修改，确认会被拒绝并要求重新预览。
+        </p>
       </div>
     </section>
   </main>

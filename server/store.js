@@ -21,6 +21,7 @@ const {
   createState,
   validateEdge,
   validateEdgeBatch,
+  validateBackup,
   previewMergeMembers,
   isReachableUp,
   MAX_MEMBERS,
@@ -258,6 +259,82 @@ function createStore(filePath) {
     return { error: null };
   }
 
+  /** 备份内容指纹（SHA-256）：预览与确认必须携带同一指纹，防止预览后文件被调换 */
+  function fingerprintOf(content) {
+    return crypto.createHash('sha256').update(String(content), 'utf8').digest('hex');
+  }
+
+  /**
+   * 备份恢复预览（只读，不修改任何数据、不推进版本）。
+   * 解析备份原文并整份严格校验（30 人上限、重复 ID、缺失端点、自指、
+   * 重复关系、每名子女至多两位父母、祖先环路），逐项返回全部问题；
+   * 同时返回内容指纹，确认恢复时必须原样带回。
+   */
+  function previewRestore(content) {
+    const fingerprint = fingerprintOf(content);
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (err) {
+      return {
+        valid: false,
+        error: '备份文件不是合法的 JSON',
+        errors: [{ where: 'file', index: null, message: `JSON 解析失败：${err.message}` }],
+        memberCount: 0,
+        edgeCount: 0,
+        members: [],
+        edges: [],
+        fingerprint,
+      };
+    }
+    const result = validateBackup(parsed, state.maxMembers);
+    return { ...result, fingerprint };
+  }
+
+  /**
+   * 备份恢复确认（乐观锁 + 内容指纹 + 服务端重验）。
+   * 版本不符（409，预览后家谱被修改）、指纹不符（409，文件在预览后被调换）
+   * 或重验失败（400，逐项 errors）都整单拒绝、不修改任何数据；
+   * 成功时以备份整体替换当前家谱，走统一 commit 入口：
+   * 变更前完整家谱成为唯一撤销快照、版本 +1、一次落盘。
+   */
+  function restoreBackup(content, fingerprint, expectedVersion) {
+    if (typeof content !== 'string' || !content.trim()) {
+      return { error: '缺少备份文件内容', status: 400 };
+    }
+    if (typeof fingerprint !== 'string' || !fingerprint.trim()) {
+      return { error: '缺少备份内容指纹，请先预览后再恢复', status: 400 };
+    }
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+      return { error: '缺少家谱版本号，请先预览后再恢复', status: 400 };
+    }
+    if (expectedVersion !== version) {
+      return {
+        error: '家谱在预览后已被修改，请重新预览后再恢复',
+        status: 409,
+        currentVersion: version,
+      };
+    }
+    if (fingerprintOf(content) !== fingerprint.trim()) {
+      return {
+        error: '备份内容指纹不符：文件在预览后已被修改，请重新选择文件并预览',
+        status: 409,
+        currentVersion: version,
+      };
+    }
+    // 服务端重验整份文件（与预览完全相同的规则）
+    const check = previewRestore(content);
+    if (!check.valid) {
+      return { error: check.error, status: 400, errors: check.errors };
+    }
+
+    const restored = stateFromValidBackup(check.members, check.edges, state.maxMembers);
+    commit(`恢复备份（${check.memberCount} 名成员、${check.edgeCount} 条关系）`, () => {
+      state = restored;
+    });
+    return { error: null };
+  }
+
   return {
     list,
     addMember,
@@ -269,6 +346,8 @@ function createStore(filePath) {
     validateEdgeBatch: (edges) => validateEdgeBatch(state, edges),
     previewMerge,
     commitMerge,
+    previewRestore,
+    restoreBackup,
     undoLast,
     getState: () => state,
     getVersion: () => version,
@@ -313,6 +392,23 @@ function familyToState(family) {
     members: family.members,
     edges: family.edges,
   });
+}
+
+/**
+ * 由已通过整份校验的备份数据重建运行时状态。
+ * 与 buildState 的净化加载不同：此处数据已被 validateBackup 证明合法
+ * （无重复 ID、无缺失端点、无自指/重复/超限/环路），按原样构建，不丢弃任何条目。
+ */
+function stateFromValidBackup(members, edges, maxMembers) {
+  const state = createState(Number.isInteger(maxMembers) ? maxMembers : MAX_MEMBERS);
+  for (const m of members) {
+    state.members.push({ id: m.id, name: m.name });
+    state.parentsOf[m.id] = [];
+  }
+  for (const e of edges) {
+    state.parentsOf[e.childId].push(e.parentId);
+  }
+  return state;
 }
 
 function loadState(filePath) {

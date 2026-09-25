@@ -11,6 +11,7 @@
 const MAX_PARENTS_PER_CHILD = 2;
 const MAX_MEMBERS = 30;
 const MAX_BATCH_EDGES = 100;
+const MAX_BACKUP_NAME_LENGTH = 50;
 
 /** 创建一个空的家谱状态对象 */
 function createState(maxMembers = MAX_MEMBERS) {
@@ -765,15 +766,201 @@ function previewEdgeImpact(state, change) {
   };
 }
 
+/**
+ * 备份文件整份校验（纯函数，不修改任何状态）。
+ *
+ * 备份格式（与下载接口一致，仅含成员 ID、姓名与关系）：
+ *   { "members": [{ "id", "name" }], "edges": [{ "parentId", "childId" }] }
+ *
+ * 按与正常录入完全相同的规则严格校验整份文件，发现的问题**逐项列入 errors，
+ * 绝不静默丢弃任何条目**：
+ *   - 文件级：顶层不是对象、缺少 members/edges 数组、成员超过 maxMembers 上限；
+ *   - 成员级（逐项）：不是对象、缺少有效 id / 姓名、姓名超过 50 字、ID 重复
+ *     （每个重复副本都报错并指出与第几项重复）；
+ *   - 关系级（逐条）：不是对象、parentId/childId 缺失或类型非法、自指、
+ *     端点不在成员列表中（缺失端点）、与前面某条完全重复（每个副本都报错）、
+ *     去重后某子女超过两位父母（按子女逐项）、祖先环路（在去重后的整张图上
+ *     对每条边做可达性判定，成环的每条边都报错）。
+ *
+ * 返回 {
+ *   valid, error,            // valid 为 false 时 error 为问题总数概要
+ *   errors: [{ where: 'file'|'member'|'edge', index: number|null, message }],
+ *   memberCount, edgeCount,  // 净化后（合法时即最终）的成员与关系数量
+ *   members: [{ id, name }], // 净化后的成员（姓名已 trim；仅 valid 时可安全恢复）
+ *   edges: [{ parentId, childId }],
+ * }
+ */
+function validateBackup(raw, maxMembers = MAX_MEMBERS) {
+  const errors = [];
+  const fileError = (message) => errors.push({ where: 'file', index: null, message });
+  const memberError = (index, message) => errors.push({ where: 'member', index, message });
+  const edgeError = (index, message) => errors.push({ where: 'edge', index, message });
+
+  const done = (members, edges) => {
+    const valid = errors.length === 0;
+    return {
+      valid,
+      error: valid ? null : `备份文件未通过校验：共 ${errors.length} 项问题`,
+      errors,
+      memberCount: members.length,
+      edgeCount: edges.length,
+      members,
+      edges,
+    };
+  };
+
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    fileError('备份文件顶层必须是 JSON 对象：{ "members": [...], "edges": [...] }');
+    return done([], []);
+  }
+  const rawMembers = raw.members;
+  const rawEdges = raw.edges;
+  if (!Array.isArray(rawMembers)) {
+    fileError('缺少 members 数组（成员列表，每项含 id 与 name）');
+  }
+  if (!Array.isArray(rawEdges)) {
+    fileError('缺少 edges 数组（父母→子女关系列表，每项含 parentId 与 childId）');
+  }
+  if (errors.length > 0) return done([], []);
+
+  // ---- 成员：结构、姓名规则、ID 重复 ----
+  if (rawMembers.length > maxMembers) {
+    fileError(`成员共 ${rawMembers.length} 人，超过 ${maxMembers} 人上限`);
+  }
+  const members = [];
+  const idFirstIndex = new Map(); // id -> 首次出现的下标（含姓名非法的条目，供端点存在性判定）
+  const nameOfId = new Map();
+  rawMembers.forEach((entry, index) => {
+    const nth = `第 ${index + 1} 项成员`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      memberError(index, `${nth}不是对象（应含 id 与 name）`);
+      return;
+    }
+    const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    let ok = true;
+    if (!id) {
+      memberError(index, `${nth}缺少有效的 id（应为非空字符串）`);
+      ok = false;
+    }
+    if (!name) {
+      memberError(index, `${nth}${id ? `（ID "${id}"）` : ''}缺少有效的姓名（应为非空字符串）`);
+      ok = false;
+    } else if (name.length > MAX_BACKUP_NAME_LENGTH) {
+      memberError(
+        index,
+        `${nth}「${name.slice(0, 12)}…」姓名 ${name.length} 字，超过 ${MAX_BACKUP_NAME_LENGTH} 字上限`,
+      );
+      ok = false;
+    }
+    if (!id) return;
+    if (idFirstIndex.has(id)) {
+      memberError(index, `${nth}的 ID "${id}" 与第 ${idFirstIndex.get(id) + 1} 项重复`);
+      return; // 重复 ID 不进入净化列表（保留首次出现）
+    }
+    idFirstIndex.set(id, index);
+    if (name) nameOfId.set(id, name);
+    if (ok) members.push({ id, name });
+  });
+
+  const label = (id) => (nameOfId.has(id) ? `「${nameOfId.get(id)}」` : `ID "${id}"`);
+
+  // ---- 关系：结构、自指、缺失端点 ----
+  const structEdges = []; // { index, parentId, childId }
+  rawEdges.forEach((entry, index) => {
+    const nth = `第 ${index + 1} 条关系`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      edgeError(index, `${nth}不是对象（应含 parentId 与 childId）`);
+      return;
+    }
+    const parentId = typeof entry.parentId === 'string' ? entry.parentId.trim() : '';
+    const childId = typeof entry.childId === 'string' ? entry.childId.trim() : '';
+    if (!parentId || !childId) {
+      const missing = [!parentId && 'parentId', !childId && 'childId'].filter(Boolean).join(' 与 ');
+      edgeError(index, `${nth}缺少有效的 ${missing}（应为非空字符串）`);
+      return;
+    }
+    if (parentId === childId) {
+      edgeError(index, `${nth}为自指关系：${label(parentId)} 不能成为自己的父母`);
+      return;
+    }
+    const missing = [];
+    if (!idFirstIndex.has(parentId)) missing.push(`父母端 ${label(parentId)}`);
+    if (!idFirstIndex.has(childId)) missing.push(`子女端 ${label(childId)}`);
+    if (missing.length > 0) {
+      edgeError(
+        index,
+        `${nth}（${label(parentId)} → ${label(childId)}）的端点不在成员列表中：${missing.join('、')}`,
+      );
+      return;
+    }
+    structEdges.push({ index, parentId, childId });
+  });
+
+  // ---- 重复关系：同一父母→子女出现多次，每个副本都报错 ----
+  const firstEdgeByKey = new Map(); // child|parent -> 首次出现的下标
+  const deduped = [];
+  for (const e of structEdges) {
+    const key = `${e.childId}|${e.parentId}`;
+    const first = firstEdgeByKey.get(key);
+    if (first !== undefined) {
+      edgeError(
+        e.index,
+        `第 ${e.index + 1} 条关系与第 ${first + 1} 条重复：${label(e.parentId)} → ${label(e.childId)}`,
+      );
+    } else {
+      firstEdgeByKey.set(key, e.index);
+      deduped.push(e);
+    }
+  }
+
+  // ---- 每名子女至多两位父母（按去重后的关系统计，逐名子女报错） ----
+  const parentsByChild = new Map();
+  for (const e of deduped) {
+    if (!parentsByChild.has(e.childId)) parentsByChild.set(e.childId, []);
+    parentsByChild.get(e.childId).push(e);
+  }
+  for (const [childId, list] of parentsByChild) {
+    if (list.length > MAX_PARENTS_PER_CHILD) {
+      const at = list.map((e) => `第 ${e.index + 1} 条`).join('、');
+      const names = list.map((e) => label(e.parentId)).join('、');
+      edgeError(
+        list[0].index,
+        `${label(childId)} 共有 ${list.length} 位父母（${names}，见${at}），` +
+          `超过每名子女至多 ${MAX_PARENTS_PER_CHILD} 位父母的上限`,
+      );
+    }
+  }
+
+  // ---- 祖先环路：在去重后的整张图上对每条边做可达性判定，成环的每条边都报错 ----
+  const cycleState = { maxMembers, members, parentsOf: {} };
+  for (const e of deduped) {
+    (cycleState.parentsOf[e.childId] ||= []).push(e.parentId);
+  }
+  for (const e of deduped) {
+    if (isReachableUp(cycleState, e.parentId, e.childId)) {
+      edgeError(
+        e.index,
+        `第 ${e.index + 1} 条关系形成祖先环路：${label(e.parentId)} 沿父母链向上可到达 ` +
+          `${label(e.childId)}，恢复后将出现循环祖先关系`,
+      );
+    }
+  }
+
+  return done(members, deduped.map((e) => ({ parentId: e.parentId, childId: e.childId })));
+}
+
 module.exports = {
   MAX_PARENTS_PER_CHILD,
   MAX_MEMBERS,
   MAX_BATCH_EDGES,
+  MAX_BACKUP_NAME_LENGTH,
   createState,
   getMember,
   isReachableUp,
   validateEdge,
   validateEdgeBatch,
+  validateBackup,
   previewMergeMembers,
   allShortestPathsUp,
   findCommonAncestors,
